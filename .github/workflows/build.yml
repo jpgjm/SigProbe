@@ -1,0 +1,108 @@
+name: Build SigProbe (unsigned IPA)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Set build timestamp (JST)
+        run: |
+          STAMP=$(TZ=Asia/Tokyo date +'%Y-%m-%dT%H-%M-%S+09-00')
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          echo "Build stamp: $STAMP"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # xcodegen / xcodebuild を走らせる前に退避する。
+      # 後で取ると SigProbe.xcodeproj や build/ が混ざる。
+      - name: Snapshot repository
+        run: |
+          mkdir -p /tmp/repo-snapshot/SigProbe
+          rsync -a --exclude='.git' ./ /tmp/repo-snapshot/SigProbe/
+          echo "=== snapshot ==="
+          find /tmp/repo-snapshot -type f | wc -l
+          du -sh /tmp/repo-snapshot
+
+      # ビルドが落ちても中身を確認できるよう always。
+      - name: Upload repository snapshot (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_Repository
+          path: /tmp/repo-snapshot
+          # .github/ や .gitignore を落とさないために必須。
+          # v4.4 以降は既定で隠しファイルが除外される。
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Show generated Info.plist
+        run: |
+          echo "----- Resources/Info.plist -----"
+          plutil -p Resources/Info.plist || cat Resources/Info.plist
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SigProbe.xcodeproj \
+            -scheme SigProbe \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_BITCODE=NO \
+            build 2>&1 | tee /tmp/xcodebuild.log
+
+      - name: Upload xcodebuild log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_xcodebuild-log
+          path: /tmp/xcodebuild.log
+          if-no-files-found: warn
+
+      - name: Verify .app
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/SigProbe.app"
+          test -d "$APP_PATH"
+          test -f "$APP_PATH/SigProbe"
+          test -f "$APP_PATH/Info.plist"
+          echo "=== Info.plist ==="
+          plutil -p "$APP_PATH/Info.plist"
+
+      - name: Package ipa
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/SigProbe.app"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry SigProbe.ipa Payload
+          rm -rf Payload
+          ls -lh SigProbe.ipa
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_SigProbe-ipa
+          path: SigProbe.ipa
+          if-no-files-found: error
